@@ -1,0 +1,128 @@
+name: Snowflake CI/CD
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+jobs:
+  deploy:
+    if: github.event_name == 'push' || (github.event.pull_request.merged == true)
+    runs-on: ubuntu-22.04
+
+    steps:
+      # Step 1: Checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Setup Snowflake CLI
+      - name: Create Snowflake private key file
+        run: |
+          echo "${{ secrets.SNOW_PRIVATE_KEY }}" > /tmp/snowflake_key.p8
+          chmod 600 /tmp/snowflake_key.p8
+      - name: Select target database
+        id: dbmap
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "db=DB_BILL_CLASSIFICATION_PRD" >> "$GITHUB_OUTPUT"
+          else
+            echo "db=DB_BILL_CLASSIFICATION_DEV" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Add pipx bin to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Snowflake CLI
+        uses: Snowflake-Labs/snowflake-cli-action@v1.5
+        with:
+          cli-version: latest
+          default-config-file-path: .snowflake/config.toml
+      - name: Set config.toml permissions
+        run: chmod 600 .snowflake/config.toml
+
+      # Step 3: Fetch latest from Snowflake Git integration repo stage
+      - name: Fetch latest from Snowflake Git integration repository stage
+        run: |
+          snow git fetch DB_BILL_CLASSIFICATION_DEV.BILLS_PROSPECT."minol_us_utility_expense_automation"
+
+      # Step 4: Ensure BILLS_PROSPECT schema exists
+      - name: Ensure BILLS_PROSPECT schema exists
+        env:
+          TARGET_DB: ${{ steps.dbmap.outputs.db }}
+        run: snow sql -q "CREATE SCHEMA IF NOT EXISTS ${TARGET_DB}.BILLS_PROSPECT;" --database "${TARGET_DB}"
+
+      # Step 5: Execute all SQL files from the Git repository stage
+      - name: Execute all SQL files from repository
+        env:
+          TARGET_DB: ${{ steps.dbmap.outputs.db }}
+        shell: bash
+        run: |
+          set -e
+          BRANCH="${{ github.ref_name }}"
+          SIMPLE_BRANCH="${BRANCH##*/}"
+          REPO_ROOT="@minol_us_utility_expense_automation/branches/${SIMPLE_BRANCH}"
+
+          echo "🚀 Executing all .sql files from ${REPO_ROOT}..."
+
+          # Execute all .sql files in all subdirectories of the branch
+          if ! snow git execute "${REPO_ROOT}/**/*.sql" \
+            --database "${TARGET_DB}" \
+            --schema "BILLS_PROSPECT" \
+            --on-error break; then
+            echo "❌ Deployment failed while executing SQL scripts."
+            exit 1
+          fi
+
+          echo "✅ Successfully executed all SQL scripts."
+
+      # Step 6: Build Snowpark Procedures
+      - name: Build Snowpark procedures
+        run: |
+          SNOWPARK_PROJECT_PATH="Snowpark"
+          if [ -f "${SNOWPARK_PROJECT_PATH}/snowflake.yml" ]; then
+            echo "📦 Building Snowpark project from '${SNOWPARK_PROJECT_PATH}'..."
+            snow snowpark build --project "${SNOWPARK_PROJECT_PATH}"
+          else
+            echo "✅ No Snowpark project found at '${SNOWPARK_PROJECT_PATH}', skipping build."
+          fi
+
+      # Step 7: Deploy Snowpark Procedures
+      - name: Deploy Snowpark procedures to target DB
+        env:
+          TARGET_DB: ${{ steps.dbmap.outputs.db }}
+        run: |
+          SNOWPARK_PROJECT_PATH="Snowpark"
+          if [ -f "${SNOWPARK_PROJECT_PATH}/snowflake.yml" ]; then
+            echo "🚀 Deploying Snowpark project from '${SNOWPARK_PROJECT_PATH}' to ${TARGET_DB}..."
+            snow snowpark deploy --project "${SNOWPARK_PROJECT_PATH}" --prune --replace \
+              --database "${TARGET_DB}" \
+              --schema "BILLS_PROSPECT"
+          else
+            echo "✅ No Snowpark project found at '${SNOWPARK_PROJECT_PATH}', skipping deploy."
+          fi
+          
+      # Step 8: Deploy Streamlit App
+      - name: Deploy Streamlit app to target DB
+        env:
+          TARGET_DB: ${{ steps.dbmap.outputs.db }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          STREAMLIT_PROJECT_PATH="Streamlit"
+          if [ -f "${STREAMLIT_PROJECT_PATH}/snowflake.yml" ]; then
+            echo "🚀 Deploying Streamlit project from '${STREAMLIT_PROJECT_PATH}' to ${TARGET_DB}..."
+            
+            # Select the correct entity (dev or prod) based on the branch
+            if [[ "$TARGET_BRANCH" == "main" ]]; then
+              TARGET_ENTITY_ID="minol_streamlit_prod"
+            else
+              TARGET_ENTITY_ID="minol_streamlit_dev"
+            fi
+
+            snow streamlit deploy "${TARGET_ENTITY_ID}" \
+              --project "${STREAMLIT_PROJECT_PATH}" \
+              --replace \
+              --database "${TARGET_DB}" \
+              --schema "BILLS_PROSPECT"
+          else
+            echo "✅ No Streamlit project found at '${STREAMLIT_PROJECT_PATH}', skipping deploy."
+          fi

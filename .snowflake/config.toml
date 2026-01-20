@@ -1,0 +1,7 @@
+[connections.deploy]
+account = "AEENOGP-BA23886"
+user = "BHAVANAVENULA03"
+role = "ACCOUNTADMIN"
+warehouse = "BILLS_PROSPECT"
+authenticator = "SNOWFLAKE_JWT"
+private_key_path = "/tmp/snowflake_key.p8"
